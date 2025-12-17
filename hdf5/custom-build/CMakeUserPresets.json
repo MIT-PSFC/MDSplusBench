@@ -1,0 +1,32 @@
+{
+    "version": 6,
+    "configurePresets": [
+        {
+            "name": "my-MDSplus-bench",
+            "inherits": [
+                "ci-GNUC",
+                "ci-Release",
+                "ci-StdCompression",
+                "ci-S3"
+            ],
+            "cacheVariables": {
+                "HDF5_BUILD_DOC": {
+                    "type": "STRING",
+                    "value": "OFF"
+                },
+                "HDF5_BUILD_EXAMPLES": {
+                    "type": "STRING",
+                    "value": "OFF"
+                },
+                "HDF5_USE_ZLIB_NG": {
+                    "type": "STRING",
+                    "value": "ON"
+                }
+            }
+        }
+    ],
+    "buildPresets": [],
+    "testPresets": [],
+    "packagePresets": [],
+    "workflowPresets": []
+}
