@@ -3,6 +3,7 @@ import json
 import logging
 import sys
 import time
+import warnings
 from collections import defaultdict, namedtuple
 from dataclasses import dataclass, field
 from itertools import product
@@ -12,16 +13,19 @@ from time import sleep
 from typing import Generator, Union
 
 import dask.config
-import fsspec
-import h5py
 import numpy as np
+import obstore as obs
 import pandas as pd
 from dask.distributed import Client, as_completed
+from obstore.store import LocalStore, S3Store
+from s3creds import get_s3_config
+from zarr.storage import ObjectStore
+import zarr
 
-if h5py.version.hdf5_version_tuple < (2, 0, 0):
-    raise RuntimeError("Must use libhdf5 2.0.0 or later")
-if not h5py.h5.get_config().ros3:
-    raise RuntimeError("Must use libhdf5 built with ros3 driver")
+# Silence the warning globally for this script execution
+warnings.filterwarnings(
+    "ignore", ".*Numcodecs codecs are not in the Zarr version 3 specification.*"
+)
 
 # Increase timeout defaults to avoid scheduler-worker comms issues...
 dask.config.set(
@@ -33,9 +37,7 @@ dask.config.set(
     }
 )
 
-lggr = logging.getLogger("mdsplusml-bench")
-
-MiB = 1024 * 1024
+lggr = logging.getLogger("mdsplusml-bench-zarr")
 
 
 @dataclass
@@ -93,29 +95,22 @@ class Timer:
 def parse_cli() -> argparse.Namespace:
     """Process command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="MDSplusML h5py benchmark script for single-shot HDF5 files",
+        description="MDSplusML benchmark script for single-shot Zarr stores",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "infolder",
-        help="A folder with single-shot HDF5 files.",
+        help="A folder with single-shot Zarr stores.",
         type=str,
         metavar="FOLDER",
     )
     parser.add_argument(
         "--read",
-        help="What data to read from the files",
+        help="What data to read from the stores",
         type=str,
         nargs="+",
         choices=["shots", "signals"],
         default=["shots", "signals"],
-    )
-    parser.add_argument(
-        "--page-cache",
-        help="File page cache size in bytes. Multiple values allowed.",
-        nargs="+",
-        type=int,
-        default=[256 * MiB],
     )
     parser.add_argument(
         "--min-workers",
@@ -166,37 +161,43 @@ def batch_tasks(num_batches: int, lst: list[dict], mode: str = "equal_effort"):
     raise ValueError(f'Unknown mode: "{mode}"')
 
 
-def gather_dset_info(h5f: h5py.File) -> dict[int, dict[str, Union[str, list[str]]]]:
-    """Discover all signal datasets in the HDF5 file.
+def gather_dset_info(
+    zroot: zarr.Group, fname: str
+) -> dict[int, dict[str, Union[str, list[str]]]]:
+    """Discover all signal datasets in the Zarr store starting from its root group.
 
-    Every dataset not a dimension scale and with a `shot` attribute is assumed
-    to be holding signal data.
+    Every array with a `shot` attribute is assumed to be holding signal data.
     """
     shots = defaultdict(list)
-    fname = h5f.filename
 
-    def dset_info(name: str, h5obj: h5py.HLObject):
-        if isinstance(h5obj, h5py.Dataset):
-            if not h5obj.is_scale:
-                shots[h5obj.attrs["shot"]].append(h5obj.name)
+    for name, zobj in zroot.members(max_depth=None):
+        if isinstance(zobj, zarr.Array) and ("shot" in zobj.attrs):
+            shots[zobj.attrs["shot"]].append(name)
 
-    h5f.visititems(dset_info)
     keys = list(shots.keys())
     if len(keys) != 1:
-        raise ValueError(f"File {h5f.filename} holds more than one shot")
-    return {keys[0]: {"h5path": next(iter(shots.values())), "fname": fname}}
+        raise ValueError(f"Store {fname} holds more than one shot (or no shots)")
+    return {keys[0]: {"zarrpath": next(iter(shots.values())), "fname": fname}}
 
 
-def reader(obj_id: str, obj: dict, worker: int, **h5f_kwargs) -> dict[str, float]:
-    """Read data for supplied selection of shots/signals in the given HDF5 file(s)."""
-    # h5py._errors.unsilence_errors()  # enable displaying full libhdf5 error stack
+def reader(obj_id: str, obj: dict, worker: int, **zarr_kwargs) -> dict[str, float]:
+    """Read data for supplied selection of shots/signals in the given Zarr store(s)."""
+    zarr_kwargs.pop("rdcc_nbytes", None)
+
     bench_data = dict()
     open_times = list()
     read_times = 0
     num_files = num_dsets = 0
     for fname, signals in obj.items():
         with Timer("open-file-time") as timer:
-            f = h5py.File(fname, mode="r", **h5f_kwargs)
+            if fname.startswith("s3://"):
+                bucket = fname.split("/")[2]
+                path = "/".join(fname.split("/")[3:])
+                store = ObjectStore(S3Store(bucket, config=get_s3_config()))
+                f = zarr.open_group(store=store, path=path, mode="r", **zarr_kwargs)
+            else:
+                store = ObjectStore(LocalStore(fname))
+                f = zarr.open_group(store=store, mode="r", **zarr_kwargs)
             num_files += 1
         open_times.append(timer.elapsed())
         with Timer("read-data-time") as timer:
@@ -204,30 +205,19 @@ def reader(obj_id: str, obj: dict, worker: int, **h5f_kwargs) -> dict[str, float
                 sig_dset = f[s]
                 sig_dset[...]
                 num_dsets += 1
-                for dim in sig_dset.dims:
-                    for scale in dim.values():
-                        scale[...]
-                        num_dsets += 1
-        read_times += timer.elapsed()
-        f.close()
 
-    # Collect page buffer cache stats only for a paged file...
-    # if (
-    #     f.id.get_create_plist().get_file_space_strategy()[0]
-    #     == h5py.h5f.FSPACE_STRATEGY_PAGE
-    # ):
-    #     bench_data["pb-size"] = f.id.get_access_plist().get_page_buffer_size()[0]
-    #     if bench_data["pb-size"] != 0:
-    #         hit_rate = lambda page_stats: 100 * (  # noqa: E731
-    #             page_stats.hits / (page_stats.accesses - page_stats.bypasses)
-    #         )
-    #         pb_stats = f.id.get_page_buffering_stats()
-    #         bench_data["pb-meta-accesses"] = pb_stats.meta.accesses
-    #         bench_data["pb-meta-hitrate"] = hit_rate(pb_stats.meta)
-    #         bench_data["pb-meta-evicts"] = pb_stats.meta.evictions
-    #         bench_data["pb-raw-accesses"] = pb_stats.raw.accesses
-    #         bench_data["pb-raw-hitrate"] = hit_rate(pb_stats.raw)
-    #         bench_data["pb-raw-evicts"] = pb_stats.raw.evictions
+                # Read all Zarr arrays listed in `_ARRAY_DIMENSIONS` (the
+                # equivalent of HDF5 dimension scales for a signal dataset). The
+                # dim coordinate arrays live in the signal's enclosing shot
+                # group -- `shots/<SHOT_ID>/<dim_name>`.
+                parts = s.split("/")
+                if "signals" in parts:
+                    shot_group = f["/".join(parts[: parts.index("signals")])]
+                    for dim_name in sig_dset.attrs.get("_ARRAY_DIMENSIONS", []):
+                        if dim_name in shot_group:
+                            shot_group[dim_name][...]
+                            num_dsets += 1
+        read_times += timer.elapsed()
 
     bench_data["median-open-file-time"] = np.median(open_times)
     bench_data["num-open-files"] = num_files
@@ -235,10 +225,8 @@ def reader(obj_id: str, obj: dict, worker: int, **h5f_kwargs) -> dict[str, float
     bench_data["obj-id"] = obj_id
     bench_data["read-data-time"] = read_times
     bench_data["num-objs"] = len(obj)
-    # bench_data["mean-obj-time"] = timer.elapsed() / len(obj)
     bench_data["num-dsets"] = num_dsets
-    # bench_data["mean-dset-time"] = timer.elapsed() / num_dsets
-    bench_data["pb-size"] = h5f_kwargs["page_buf_size"]
+
     return bench_data
 
 
@@ -254,62 +242,79 @@ if __name__ == "__main__":
     lggr.debug("Runtime options: %s", cli)
 
     if cli.infolder.startswith("s3://"):
-        fs = fsspec.filesystem("s3")
+        bucket = cli.infolder.split("/")[2]
+        obs_store = S3Store(bucket, config=get_s3_config())
+        prefix = "/".join(cli.infolder.split("/")[3:])
+        if prefix and not prefix.endswith("/"):
+            prefix += "/"
+
+        res = obs.list_with_delimiter(obs_store, prefix=prefix)
+        prefixes = res.get("common_prefixes", [])
+        shot_files = sorted(
+            [
+                f"s3://{bucket}/{p.rstrip('/')}"
+                for p in prefixes
+                if p.rstrip("/").endswith(".zarr")
+            ]
+        )
     else:
-        fs = fsspec.filesystem("file")
-    shot_files = sorted(fs.glob(cli.infolder + "/*.hdf5"))
-    lggr.info("Found %d shot files at %s", len(shot_files), cli.infolder)
+        shot_files = sorted(
+            [str(p.resolve()) for p in Path(cli.infolder).glob("*.zarr")]
+        )
+
+    lggr.info("Found %d shot stores at %s", len(shot_files), cli.infolder)
     if len(shot_files) == 0:
-        raise SystemExit(f"No shot files found in {cli.infolder}")
+        raise SystemExit(f"No shot stores found in {cli.infolder}")
     else:
-        lggr.debug("List of shot files: %r", shot_files)
+        lggr.debug("List of shot stores: %r", shot_files)
 
     cpus = cpu_count()
     lggr.debug("The number of CPUs reported: %d", cpus)
 
-    # Figure out h5py file open settings...
-    if "s3" in fs.protocol:
-        h5py_kwargs = {"driver": "ros3", "page_buf_size": 64 * MiB}
+    # Specific zarr config on open...
+    zarr_kwargs = {"use_consolidated": True}
 
-        # fs.glob() output currently does not have the s3 schema part so add it here...
-        shot_files = ["s3://" + _ for _ in shot_files]
-    else:
-        h5py_kwargs = dict()
-
-    # Gather info about the content in the files...
-    lggr.info(f"Gathering file content info from {len(shot_files)}...")
+    # Gather info about the content in the stores...
+    lggr.info(f"Gathering store content info from {len(shot_files)}...")
     shots = dict()
     with Timer("gather-info") as gather:
         for _ in shot_files:
             lggr.debug("Gathering content info from %s", _)
-            with h5py.File(_, mode="r", **h5py_kwargs) as f:
-                objs = gather_dset_info(f)
+            if _.startswith("s3://"):
+                bucket = _.split("/")[2]
+                path = "/".join(_.split("/")[3:])
+                store = ObjectStore(S3Store(bucket, config=get_s3_config()))
+                root = zarr.open_group(store=store, path=path, mode="r", **zarr_kwargs)
+            else:
+                store = ObjectStore(LocalStore(_))
+                root = zarr.open_group(store=store, mode="r", **zarr_kwargs)
+
+            objs = gather_dset_info(root, _)
             shots.update(objs)
-    lggr.info("Gathering file content time = %.4f seconds", gather.elapsed())
+    lggr.info("Gathering store content time = %.4f seconds", gather.elapsed())
 
     # Re-arrange per-shot info into per-signal...
     signals = defaultdict(list)
     for _ in shots.values():
         fname = _["fname"]
-        for s in _["h5path"]:
+        for s in _["zarrpath"]:
             name_parts = Path(s).parts
             try:
-                # "signals" must be in the HDF5 path
+                # "signals" must be in the Zarr path
                 signals_index = name_parts.index("signals")
             except ValueError:
                 continue
 
-            # For signal identifier across files use only its latter part of the
-            # HDF5 dataset's path without the shot number.
+            # For signal identifier across stores use only its latter part of the
+            # Zarr array's path without the shot number.
             signals["/".join(name_parts[slice(signals_index + 1, None)])].append(
-                {"h5path": s, "fname": fname}
+                {"zarrpath": s, "fname": fname}
             )
 
     # Run the benchmarks with different parameters...
     bench_data = list()
     prev_num_workers = {"shots": -1, "signals": -1}
     for rp in bench_params(
-        pb_size=cli.page_cache,
         num_workers=[  # number of Dask workers
             1,
             2,
@@ -355,9 +360,6 @@ if __name__ == "__main__":
                 cpus,
             )
 
-        h5py_kwargs.update({"rdcc_nbytes": 8 * MiB, "page_buf_size": rp.pb_size})
-        lggr.debug("h5py.File kwargs: %s", h5py_kwargs)
-
         if rp.shots is None and rp.signals is not None:
             objs = signals
             obj_type = "signals"
@@ -375,7 +377,7 @@ if __name__ == "__main__":
 
         # Run the benchmark cases...
         if obj_type == "shots":
-            # Given the max num. workers and all the shot files, break down the
+            # Given the max num. workers and all the shot stores, break down the
             # work in tasks and determine actual num. workers based on the
             # batching mode.
             tasks = batch_tasks(rp.num_workers, use_objs, mode="equal_effort")
@@ -389,7 +391,7 @@ if __name__ == "__main__":
                 prev_num_workers[obj_type] = num_workers
 
             lggr.info(
-                "Reading from %d shot files with %d signals and their scales using %d worker(s)",
+                "Reading from %d shot stores with %d signals and their scales using %d worker(s)",
                 len(use_objs),
                 len(signals),
                 num_workers,
@@ -408,9 +410,9 @@ if __name__ == "__main__":
                     bf = dask_client.submit(
                         reader,
                         "shot files",
-                        dict((objs[_]["fname"], objs[_]["h5path"]) for _ in shot_ids),
+                        dict((objs[_]["fname"], objs[_]["zarrpath"]) for _ in shot_ids),
                         worker,
-                        **h5py_kwargs,
+                        **zarr_kwargs,
                     )
                     bench_futures.append(bf)
                     worker += 1
@@ -436,7 +438,7 @@ if __name__ == "__main__":
                 prev_num_workers[obj_type] = num_workers
 
             lggr.info(
-                "Reading %d signals and their scales from %d files using %d worker(s)",
+                "Reading %d signals and their scales from %d stores using %d worker(s)",
                 len(use_objs),
                 len(shot_files),
                 num_workers,
@@ -460,9 +462,9 @@ if __name__ == "__main__":
                         bf = dask_client.submit(
                             reader,
                             sig,
-                            dict((_["fname"], [_["h5path"]]) for _ in batch),
+                            dict((_["fname"], [_["zarrpath"]]) for _ in batch),
                             worker,
-                            **h5py_kwargs,
+                            **zarr_kwargs,
                         )
                         bench_futures.append(bf)
                         worker += 1
